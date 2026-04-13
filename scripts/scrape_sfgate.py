@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -21,6 +22,7 @@ import requests
 
 DEFAULT_URL = "https://www.sfgate.com/thingstodo/"
 SOURCE = "sfgate"
+EVVNT_API_BASE = "https://discovery.evvnt.com/api"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -48,6 +50,23 @@ class StoryRecord:
     scraped_from: str
 
 
+@dataclass
+class EventRecord:
+    title: str
+    source: str
+    source_url: str
+    category: Optional[str]
+    description: Optional[str]
+    venue_name: Optional[str]
+    location: Optional[str]
+    start_time: Optional[str]
+    end_time: Optional[str]
+    image_url: Optional[str]
+    organizer: Optional[str]
+    event_id: Optional[str]
+    scraped_from: str
+
+
 class ScrapeError(RuntimeError):
     """Raised when the scraper cannot extract the page data we need."""
 
@@ -71,6 +90,14 @@ def extract_next_data(html: str) -> Dict[str, Any]:
         return json.loads(match.group(1))
     except json.JSONDecodeError as exc:
         raise ScrapeError("Failed to decode __NEXT_DATA__ JSON.") from exc
+
+
+def extract_evvnt_config(html: str) -> Tuple[str, int]:
+    api_key_match = re.search(r'api_key:\s*"([^"]+)"', html)
+    publisher_match = re.search(r"publisher_id:\s*(\d+)", html)
+    if not api_key_match or not publisher_match:
+        raise ScrapeError("Could not find EVVNT widget configuration on the page.")
+    return api_key_match.group(1), int(publisher_match.group(1))
 
 
 def text_or_none(value: Any) -> Optional[str]:
@@ -112,6 +139,79 @@ def infer_section_from_url(source_url: str) -> Optional[str]:
     if not first_segment:
         return None
     return first_segment.replace("-", " ")
+
+
+def build_location(event: Dict[str, Any]) -> Optional[str]:
+    venue = event.get("venue") or {}
+    town = text_or_none(venue.get("town"))
+    country = text_or_none((event.get("country") or {}).get("name"))
+    parts = [part for part in (town, country) if part]
+    return ", ".join(parts) or None
+
+
+def normalize_evvnt_event(event: Dict[str, Any], page_url: str) -> Optional[EventRecord]:
+    title = text_or_none(event.get("title"))
+    source_url = text_or_none(event.get("source_broadcast_url"))
+    if not title or not source_url:
+        return None
+
+    images = event.get("images") or []
+    first_image = images[0] if images else {}
+    image_url = (
+        text_or_none(((first_image.get("featured_webp") or {}).get("url")))
+        or text_or_none(((first_image.get("featured") or {}).get("url")))
+        or text_or_none(((first_image.get("hero_webp") or {}).get("url")))
+        or text_or_none(((first_image.get("hero") or {}).get("url")))
+        or text_or_none(((first_image.get("original") or {}).get("url")))
+    )
+
+    venue = event.get("venue") or {}
+    return EventRecord(
+        title=title,
+        source=SOURCE,
+        source_url=source_url,
+        category=text_or_none(event.get("category_name")),
+        description=text_or_none(event.get("summary")) or text_or_none(event.get("description")),
+        venue_name=text_or_none(venue.get("name")),
+        location=build_location(event),
+        start_time=text_or_none(event.get("start_time")),
+        end_time=text_or_none(event.get("end_time")),
+        image_url=image_url,
+        organizer=text_or_none(event.get("organiser_name")),
+        event_id=str(event.get("source_id")) if event.get("source_id") is not None else None,
+        scraped_from=page_url,
+    )
+
+
+def fetch_evvnt_home_page_events(api_key: str, publisher_id: int, timeout: int) -> List[Dict[str, Any]]:
+    response = requests.get(
+        f"{EVVNT_API_BASE}/publisher/{publisher_id}/home_page_events",
+        params={"api_key": api_key},
+        headers=DEFAULT_HEADERS,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return payload.get("rawEvents") or []
+
+
+def extract_featured_events(page_url: str, timeout: int) -> List[EventRecord]:
+    html = fetch_html(page_url, timeout)
+    api_key, publisher_id = extract_evvnt_config(html)
+    raw_events = fetch_evvnt_home_page_events(api_key, publisher_id, timeout)
+    records: List[EventRecord] = []
+    seen_urls = set()
+
+    for event in raw_events:
+        if not isinstance(event, dict):
+            continue
+        record = normalize_evvnt_event(event, page_url)
+        if not record or record.source_url in seen_urls:
+            continue
+        seen_urls.add(record.source_url)
+        records.append(record)
+
+    return records
 
 
 def normalize_item(item: Dict[str, Any], collection: Optional[str], page_url: str) -> Optional[StoryRecord]:
@@ -200,6 +300,26 @@ def filter_records(records: Iterable[StoryRecord], keyword: Optional[str]) -> Li
     return filtered
 
 
+def filter_event_records(records: Iterable[EventRecord], keyword: Optional[str]) -> List[EventRecord]:
+    if not keyword:
+        return list(records)
+
+    needle = keyword.lower()
+    filtered: List[EventRecord] = []
+    for record in records:
+        haystacks = [
+            record.title,
+            record.category or "",
+            record.description or "",
+            record.venue_name or "",
+            record.location or "",
+            record.source_url,
+        ]
+        if any(needle in value.lower() for value in haystacks):
+            filtered.append(record)
+    return filtered
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Scrape SFGATE's Things To Do stories into structured JSON."
@@ -226,6 +346,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Pretty-print the JSON output.",
     )
+    parser.add_argument(
+        "--output",
+        help="Optional path to write the JSON payload to disk.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("stories", "featured-events"),
+        default="stories",
+        help="Choose whether to scrape SFGATE editorial stories or EVVNT featured events.",
+    )
     return parser
 
 
@@ -234,19 +364,34 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        html = fetch_html(args.url, args.timeout)
-        next_data = extract_next_data(html)
-        records = extract_records(next_data, args.url)
-        records = filter_records(records, args.keyword)
+        if args.mode == "featured-events":
+            records = extract_featured_events(args.url, args.timeout)
+            records = filter_event_records(records, args.keyword)
+        else:
+            html = fetch_html(args.url, args.timeout)
+            next_data = extract_next_data(html)
+            records = extract_records(next_data, args.url)
+            records = filter_records(records, args.keyword)
     except (requests.RequestException, ScrapeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
     payload = [asdict(record) for record in records[: max(args.limit, 0)]]
-    if args.pretty:
-        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    json_text = (
+        json.dumps(payload, indent=2, ensure_ascii=False)
+        if args.pretty
+        else json.dumps(payload, ensure_ascii=False)
+    )
+
+    if args.output:
+        output_dir = os.path.dirname(os.path.abspath(args.output))
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        with open(args.output, "w", encoding="utf-8") as file:
+            file.write(json_text)
+            file.write("\n")
     else:
-        print(json.dumps(payload, ensure_ascii=False))
+        print(json_text)
     return 0
 
 
