@@ -14,10 +14,17 @@ import os
 import re
 import sys
 from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import requests
+
+# Add parent directory to sys.path to import schemas module
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from schemas import StandardizedEvent
+from schemas.sfgate import SFGateEventRecord, normalize_to_standardized_event
 
 
 DEFAULT_URL = "https://www.sfgate.com/thingstodo/"
@@ -47,23 +54,6 @@ class StoryRecord:
     authors: List[str]
     published_at: Optional[str]
     image_url: Optional[str]
-    scraped_from: str
-
-
-@dataclass
-class EventRecord:
-    title: str
-    source: str
-    source_url: str
-    category: Optional[str]
-    description: Optional[str]
-    venue_name: Optional[str]
-    location: Optional[str]
-    start_time: Optional[str]
-    end_time: Optional[str]
-    image_url: Optional[str]
-    organizer: Optional[str]
-    event_id: Optional[str]
     scraped_from: str
 
 
@@ -149,12 +139,70 @@ def build_location(event: Dict[str, Any]) -> Optional[str]:
     return ", ".join(parts) or None
 
 
-def normalize_evvnt_event(event: Dict[str, Any], page_url: str) -> Optional[EventRecord]:
+def normalize_evvnt_event(
+    event: Dict[str, Any], page_url: str, event_type: Optional[str] = None, debug: bool = False
+) -> Optional[SFGateEventRecord]:
     title = text_or_none(event.get("title"))
     source_url = text_or_none(event.get("source_broadcast_url"))
     if not title or not source_url:
         return None
 
+    venue = event.get("venue") or {}
+    
+    # Extract price information from the prices field
+    prices_data = event.get("prices")
+    ticket_price = None
+    is_free = None
+    
+    if debug:
+        print(f"\n=== Debug info for '{title}' ===", file=sys.stderr)
+        print(f"All keys: {sorted(event.keys())}", file=sys.stderr)
+        print(f"prices field type: {type(prices_data)}", file=sys.stderr)
+        print(f"prices field value: {prices_data}", file=sys.stderr)
+        print(f"=== End debug ===\n", file=sys.stderr)
+    
+    if prices_data:
+        if isinstance(prices_data, dict):
+            # prices is a dict like {'After Dark 18+': 'USD 22.95'}
+            # Combine all ticket types and prices into a readable string
+            price_parts = []
+            all_free = True
+            has_prices = False
+            
+            for ticket_type, price_value in prices_data.items():
+                price_str = text_or_none(price_value)
+                if price_str:
+                    has_prices = True
+                    # Format as "ticket_type: price"
+                    price_parts.append(f"{ticket_type}: {price_str}")
+                    # Check if this price indicates free
+                    price_lower = price_str.lower()
+                    if not any(indicator in price_lower for indicator in ["free", "$0", "0.0", "0.00", "no charge", "complimentary", "no cost"]):
+                        all_free = False
+            
+            if price_parts:
+                ticket_price = " | ".join(price_parts)
+                is_free = all_free if has_prices else None
+        elif isinstance(prices_data, str):
+            ticket_price = text_or_none(prices_data)
+        elif isinstance(prices_data, list) and prices_data:
+            # If it's a list, take the first item
+            first_price = prices_data[0]
+            if isinstance(first_price, dict):
+                ticket_price = (
+                    text_or_none(first_price.get("description"))
+                    or text_or_none(first_price.get("text"))
+                    or text_or_none(first_price.get("price"))
+                )
+            elif isinstance(first_price, str):
+                ticket_price = text_or_none(first_price)
+    
+    # If we have price text but haven't determined if it's free, analyze the text
+    if ticket_price and is_free is None:
+        price_lower = ticket_price.lower()
+        is_free = any(indicator in price_lower for indicator in ["free", "$0", "0.0", "0.00", "no charge", "complimentary", "no cost"])
+    
+    # Extract image URL from EVVNT images array
     images = event.get("images") or []
     first_image = images[0] if images else {}
     image_url = (
@@ -164,26 +212,37 @@ def normalize_evvnt_event(event: Dict[str, Any], page_url: str) -> Optional[Even
         or text_or_none(((first_image.get("hero") or {}).get("url")))
         or text_or_none(((first_image.get("original") or {}).get("url")))
     )
-
-    venue = event.get("venue") or {}
-    return EventRecord(
+    
+    return SFGateEventRecord(
         title=title,
         source=SOURCE,
         source_url=source_url,
         category=text_or_none(event.get("category_name")),
         description=text_or_none(event.get("summary")) or text_or_none(event.get("description")),
-        venue_name=text_or_none(venue.get("name")),
+        venue=text_or_none(venue.get("name")),
         location=build_location(event),
         start_time=text_or_none(event.get("start_time")),
         end_time=text_or_none(event.get("end_time")),
-        image_url=image_url,
+        featured=event_type == "featured" if event_type else None,
         organizer=text_or_none(event.get("organiser_name")),
+        ticket_price=ticket_price,
+        is_free=is_free,
+        # SFGATE/EVVNT specific fields
         event_id=str(event.get("source_id")) if event.get("source_id") is not None else None,
-        scraped_from=page_url,
+        image_url=image_url,
+        door_time=text_or_none(event.get("door_time")),
+        eventbrite_id=text_or_none(event.get("eventbrite_id")),
     )
 
 
-def fetch_evvnt_home_page_events(api_key: str, publisher_id: int, timeout: int) -> List[Dict[str, Any]]:
+def fetch_evvnt_home_page_events(
+    api_key: str, publisher_id: int, timeout: int
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Fetch events from EVVNT API.
+    
+    Returns:
+        Tuple of (featured_events, upcoming_events)
+    """
     response = requests.get(
         f"{EVVNT_API_BASE}/publisher/{publisher_id}/home_page_events",
         params={"api_key": api_key},
@@ -192,24 +251,67 @@ def fetch_evvnt_home_page_events(api_key: str, publisher_id: int, timeout: int) 
     )
     response.raise_for_status()
     payload = response.json()
-    return payload.get("rawEvents") or []
+    return (
+        payload.get("rawFeaturedEvents") or [],
+        payload.get("rawEvents") or [],
+    )
 
 
-def extract_featured_events(page_url: str, timeout: int) -> List[EventRecord]:
+def extract_featured_events(
+    page_url: str, timeout: int, event_types: str = "both", debug: bool = False
+) -> List[StandardizedEvent]:
+    """Extract events from SFGATE Things To Do page.
+    
+    Args:
+        page_url: URL to scrape
+        timeout: HTTP timeout in seconds
+        event_types: Which events to include - "featured", "upcoming", or "both"
+        debug: If True, print debug info for first event
+    
+    Returns:
+        List of StandardizedEvent objects
+    """
     html = fetch_html(page_url, timeout)
     api_key, publisher_id = extract_evvnt_config(html)
-    raw_events = fetch_evvnt_home_page_events(api_key, publisher_id, timeout)
-    records: List[EventRecord] = []
+    featured_events, upcoming_events = fetch_evvnt_home_page_events(
+        api_key, publisher_id, timeout
+    )
+    
+    records: List[StandardizedEvent] = []
     seen_urls = set()
+    debug_shown = False
 
-    for event in raw_events:
-        if not isinstance(event, dict):
-            continue
-        record = normalize_evvnt_event(event, page_url)
-        if not record or record.source_url in seen_urls:
-            continue
-        seen_urls.add(record.source_url)
-        records.append(record)
+    # Process featured events
+    if event_types in ("featured", "both"):
+        for event in featured_events:
+            if not isinstance(event, dict):
+                continue
+            show_debug = debug and not debug_shown
+            sfgate_record = normalize_evvnt_event(event, page_url, event_type="featured", debug=show_debug)
+            if show_debug:
+                debug_shown = True
+            if not sfgate_record or sfgate_record.source_url in seen_urls:
+                continue
+            seen_urls.add(sfgate_record.source_url)
+            # Normalize to standardized format before adding
+            standardized_record = normalize_to_standardized_event(sfgate_record)
+            records.append(standardized_record)
+
+    # Process upcoming events
+    if event_types in ("upcoming", "both"):
+        for event in upcoming_events:
+            if not isinstance(event, dict):
+                continue
+            show_debug = debug and not debug_shown
+            sfgate_record = normalize_evvnt_event(event, page_url, event_type="upcoming", debug=show_debug)
+            if show_debug:
+                debug_shown = True
+            if not sfgate_record or sfgate_record.source_url in seen_urls:
+                continue
+            seen_urls.add(sfgate_record.source_url)
+            # Normalize to standardized format before adding
+            standardized_record = normalize_to_standardized_event(sfgate_record)
+            records.append(standardized_record)
 
     return records
 
@@ -300,18 +402,19 @@ def filter_records(records: Iterable[StoryRecord], keyword: Optional[str]) -> Li
     return filtered
 
 
-def filter_event_records(records: Iterable[EventRecord], keyword: Optional[str]) -> List[EventRecord]:
+def filter_event_records(records: Iterable[StandardizedEvent], keyword: Optional[str]) -> List[StandardizedEvent]:
+    """Filter standardized event records by keyword."""
     if not keyword:
         return list(records)
 
     needle = keyword.lower()
-    filtered: List[EventRecord] = []
+    filtered: List[StandardizedEvent] = []
     for record in records:
         haystacks = [
             record.title,
             record.category or "",
             record.description or "",
-            record.venue_name or "",
+            record.venue or "",
             record.location or "",
             record.source_url,
         ]
@@ -356,6 +459,17 @@ def build_parser() -> argparse.ArgumentParser:
         default="stories",
         help="Choose whether to scrape SFGATE editorial stories or EVVNT featured events.",
     )
+    parser.add_argument(
+        "--event-types",
+        choices=("featured", "upcoming", "both"),
+        default="both",
+        help="When mode is 'featured-events', which event types to include (default: both).",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print debug information about available API fields (for first event).",
+    )
     return parser
 
 
@@ -365,7 +479,7 @@ def main() -> int:
 
     try:
         if args.mode == "featured-events":
-            records = extract_featured_events(args.url, args.timeout)
+            records = extract_featured_events(args.url, args.timeout, args.event_types, args.debug)
             records = filter_event_records(records, args.keyword)
         else:
             html = fetch_html(args.url, args.timeout)
