@@ -139,6 +139,46 @@ def build_location(event: Dict[str, Any]) -> Optional[str]:
     return ", ".join(parts) or None
 
 
+def extract_numeric_price(price_str: str) -> Optional[float]:
+    """Extract numeric price from formatted price string.
+    
+    Handles various formats:
+    - "USD 22.95" -> 22.95
+    - "General: USD 20 | Student: USD 15" -> 15.0 (minimum)
+    - "Free: USD 0.0" -> 0.0
+    
+    Args:
+        price_str: Formatted price string
+        
+    Returns:
+        Numeric price value, or None if no valid number found
+    """
+    if not price_str:
+        return None
+    
+    # Find all numeric values in the string (handles "USD 22.95", "$22.95", "22.95", etc.)
+    import re
+    pattern = r'(\d+\.?\d*)'
+    matches = re.findall(pattern, price_str)
+    
+    if not matches:
+        return None
+    
+    # Convert to floats
+    prices = []
+    for match in matches:
+        try:
+            prices.append(float(match))
+        except ValueError:
+            continue
+    
+    if not prices:
+        return None
+    
+    # Return minimum price (lowest entry point)
+    return min(prices)
+
+
 def normalize_evvnt_event(
     event: Dict[str, Any], page_url: str, event_type: Optional[str] = None, debug: bool = False
 ) -> Optional[SFGateEventRecord]:
@@ -223,11 +263,11 @@ def normalize_evvnt_event(
         location=build_location(event),
         start_time=text_or_none(event.get("start_time")),
         end_time=text_or_none(event.get("end_time")),
-        featured=event_type == "featured" if event_type else None,
         organizer=text_or_none(event.get("organiser_name")),
         ticket_price=ticket_price,
         is_free=is_free,
         # SFGATE/EVVNT specific fields
+        featured=event_type == "featured" if event_type else None,
         event_id=str(event.get("source_id")) if event.get("source_id") is not None else None,
         image_url=image_url,
         door_time=text_or_none(event.get("door_time")),

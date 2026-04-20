@@ -6,37 +6,23 @@ This module defines SFGATE-specific event representations and normalization logi
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from schemas.event import StandardizedEvent
+from schemas.event import StandardizedEvent, BaseEventRecord
 
 
 @dataclass
-class SFGateEventRecord:
+class SFGateEventRecord(BaseEventRecord):
     """SFGATE/EVVNT-specific event record.
     
     This is the internal representation used during SFGATE scraping.
     Gets normalized to StandardizedEvent before output.
     
-    Core fields match StandardizedEvent, plus SFGATE-specific fields:
+    Inherits core fields from BaseEventRecord, plus SFGATE-specific fields:
         event_id: EVVNT event source ID
         image_url: Event image URL from EVVNT
         door_time: Door opening time in ISO 8601 format
         eventbrite_id: Eventbrite ID if event is also on Eventbrite
         featured: Whether event is featured on SFGATE
     """
-    # Core fields (match StandardizedEvent)
-    title: str
-    source: str
-    source_url: str
-    category: Optional[str]
-    description: Optional[str]
-    venue: Optional[str]
-    location: Optional[str]
-    start_time: Optional[str]
-    end_time: Optional[str]
-    organizer: Optional[str]
-    ticket_price: Optional[str]
-    is_free: Optional[bool]
-    
     # SFGATE/EVVNT specific fields
     featured: Optional[bool]
     event_id: Optional[str]

@@ -48,7 +48,7 @@ class StandardizedEvent:
     category: Optional[str]                 # Event category
     description: Optional[str]              # Event description
     organizer: Optional[str]                # Organizer name
-    ticket_price: Optional[str]             # Human-readable price
+    ticket_price: Optional[float]           # Numeric price (minimum if multiple tiers)
     is_free: Optional[bool]                 # Whether event is free
     source_metadata: Optional[Dict[str, Any]]  # Source-specific fields
 ```
@@ -67,13 +67,14 @@ class StandardizedEvent:
   "category": "Museum",
   "description": "Climate change is a complex problem...",
   "organizer": "The Exploratorium",
-  "ticket_price": "After Dark 18+: USD 22.95",
+  "ticket_price": 22.95,
   "is_free": false,
   "source_metadata": {
     "featured": true,
     "event_id": "3559981",
     "image_url": "https://cdn.prod.discovery.evvnt.com/...",
-    "door_time": "2026-04-23T17:30:00-07:00"
+    "door_time": "2026-04-23T17:30:00-07:00",
+    "ticket_price_formatted": "After Dark 18+: USD 22.95"
   }
 }
 ```
@@ -244,12 +245,36 @@ from schemas.eventbrite import EventbriteEventRecord
 from schemas.sfgate import SFGateEventRecord
 ```
 
+## Price Handling
+
+### Numeric Price Extraction
+
+The `ticket_price` field is a float for queryability and filtering:
+
+**Price Extraction Rules:**
+1. Extract all numeric values from price strings
+2. For multiple price tiers (e.g., "General: USD 20 | Student: USD 15"), use **minimum** price
+3. Free events have `ticket_price: 0.0` and `is_free: true`
+4. Original formatted price string is preserved in `source_metadata.ticket_price_formatted`
+
+**Examples:**
+- `"USD 22.95"` → `22.95`
+- `"General: USD 20 | Student: USD 15"` → `15.0` (minimum)
+- `"Free: USD 0.0"` → `0.0`
+
+**Benefits:**
+- Sort events by price
+- Filter by price range: `price < 20.0`
+- Query free events: `is_free == true` or `price == 0.0`
+- Still have original formatted text for display
+
 ## Benefits
 
 ### For Querying
 - All events searchable by standard fields
 - Easy filtering by venue, category, price, etc.
 - Simple cross-source deduplication
+- Numeric price enables sorting and range queries
 
 ### For Development
 - Clear separation of concerns

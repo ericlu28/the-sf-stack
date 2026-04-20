@@ -9,6 +9,28 @@ from typing import Any, Dict, Optional
 
 
 @dataclass
+class BaseEventRecord:
+    """Base event record containing core fields common to all event sources.
+    
+    Source-specific event records should inherit from this class and add their
+    own source-specific fields. This eliminates duplication of core field
+    definitions across source schemas.
+    """
+    title: str
+    source: str
+    source_url: str
+    start_time: Optional[str]
+    end_time: Optional[str]
+    venue: Optional[str]
+    location: Optional[str]
+    category: Optional[str]
+    description: Optional[str]
+    organizer: Optional[str]
+    ticket_price: Optional[str]
+    is_free: Optional[bool]
+
+
+@dataclass
 class StandardizedEvent:
     """Standardized event schema used across all event sources.
     
@@ -26,7 +48,8 @@ class StandardizedEvent:
         category: Event category/type
         description: Event description
         organizer: Name of event organizer
-        ticket_price: Human-readable ticket price(s), e.g., "General: USD 20 | Student: USD 15"
+        ticket_price: Human-readable ticket price string (e.g., "USD 20", "FREE*").
+                     For events with multiple tiers, format as "Type: Price | Type: Price".
         is_free: Whether the event is free to attend
         source_metadata: Dictionary containing source-specific fields that don't fit
                         in the core schema. This preserves data without cluttering
@@ -49,7 +72,8 @@ class StandardizedEvent:
             "source_metadata": {
                 "featured": true,
                 "event_id": "3559981",
-                "image_url": "https://cdn.prod.discovery.evvnt.com/..."
+                "image_url": "https://cdn.prod.discovery.evvnt.com/...",
+                "ticket_price_formatted": "After Dark 18+: USD 22.95"
             }
         }
     """

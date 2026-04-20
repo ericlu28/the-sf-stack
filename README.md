@@ -8,13 +8,82 @@ Early scraping utilities for building an SF events aggregation pipeline.
 the-sf-stack/
 ├── schemas/              # Event schema definitions
 │   ├── event.py         # StandardizedEvent base schema
-│   └── sfgate.py        # SFGATE-specific schemas
+│   ├── sfgate.py        # SFGATE-specific schemas
+│   └── funcheap.py      # FunCheap-specific schemas
 ├── scripts/              # Scraping scripts
-│   └── scrape_sfgate.py # SFGATE/EVVNT scraper
+│   ├── scrape_sfgate.py # SFGATE/EVVNT scraper
+│   └── scrape_funcheap.py # FunCheap scraper
 └── data/                 # Scraped data output
 ```
 
 All events are normalized to a `StandardizedEvent` schema defined in `schemas/event.py`. Source-specific fields are preserved in `source_metadata`. See [ARCHITECTURE.md](ARCHITECTURE.md) for details.
+
+## FunCheap Scraper
+
+Scrapes events from FunCheap's SF events calendar at `https://sf.funcheap.com/events/`.
+
+Basic usage:
+
+```bash
+python3 scripts/scrape_funcheap.py --pretty
+```
+
+Write to file:
+
+```bash
+python3 scripts/scrape_funcheap.py --pretty --output data/funcheap-events.json
+```
+
+Filter by keyword:
+
+```bash
+python3 scripts/scrape_funcheap.py --keyword comedy --pretty
+```
+
+Limit results:
+
+```bash
+python3 scripts/scrape_funcheap.py --limit 25 --pretty
+```
+
+### FunCheap Source Metadata
+
+When `source` is "funcheap", the `source_metadata` object may include:
+- `post_id` (string) - FunCheap post ID
+- `is_top_pick` (boolean) - Whether event is marked as Editor's Top Pick
+- `price_note` (string) - Additional price details from tooltip
+- `categories` (list) - Event categories (e.g., ["comedy", "in person"])
+- `region` (string) - Geographic region (e.g., "San Francisco", "East Bay")
+
+**Example Output:**
+```json
+{
+  "title": "Free Monday Comedy Night in Downtown SF",
+  "source": "funcheap",
+  "source_url": "https://sf.funcheap.com/free-monday-comedy-night-in-downtown-sf-2/",
+  "start_time": "2026-04-20T19:00:00-07:00",
+  "end_time": null,
+  "venue": null,
+  "location": null,
+  "category": "top pick",
+  "description": null,
+  "organizer": null,
+  "ticket_price": "FREE*",
+  "is_free": true,
+  "source_metadata": {
+    "post_id": "1613405",
+    "is_top_pick": true,
+    "price_note": "*Free with RSVP",
+    "categories": [
+      "top pick",
+      "comedy event types event",
+      "downtown san francisco",
+      "funcheap presents",
+      "in person"
+    ]
+  }
+}
+```
 
 ## SFGATE scraper
 
@@ -94,7 +163,7 @@ All events use a standardized schema regardless of source:
 - `category` (string|null) - Event category
 - `description` (string|null) - Event description
 - `organizer` (string|null) - Event organizer name
-- `ticket_price` (string|null) - Ticket prices (e.g., "General: USD 20 | Student: USD 15")
+- `ticket_price` (string|null) - Human-readable ticket price (e.g., "USD 20", "FREE*")
 - `is_free` (boolean|null) - Whether the event is free
 - `source_metadata` (object|null) - Source-specific fields
 
@@ -142,31 +211,40 @@ The scraper uses a **standardized schema** with **source-specific metadata** to 
 
 To add a new event source:
 
-1. Create a source-specific dataclass (e.g., `EventbriteEventRecord`)
-2. Implement a scraping function that returns source-specific records
-3. Create a normalization function: `normalize_to_standardized_event()`
-4. Map core fields + put extras in `source_metadata`
+1. Create a source-specific dataclass that inherits from `BaseEventRecord`
+2. Add only source-specific fields (core fields are inherited)
+3. Implement a scraping function that returns source-specific records
+4. Create a normalization function: `normalize_to_standardized_event()`
+5. Map core fields + put extras in `source_metadata`
 
 **Example:**
 ```python
+from schemas.event import BaseEventRecord, StandardizedEvent
+
 @dataclass
-class EventbriteEventRecord:
-    title: str
-    # ... core fields ...
-    # Eventbrite-specific fields
+class EventbriteEventRecord(BaseEventRecord):
+    """Inherits core fields from BaseEventRecord."""
+    # Only define Eventbrite-specific fields
     eventbrite_id: str
     series_id: Optional[str]
-    # ...
 
 def normalize_eventbrite_to_standard(eb_event: EventbriteEventRecord) -> StandardizedEvent:
     return StandardizedEvent(
-        # ... map core fields ...
+        # Core fields from BaseEventRecord
+        title=eb_event.title,
+        source=eb_event.source,
+        # ... map remaining core fields ...
         source_metadata={
             "eventbrite_id": eb_event.eventbrite_id,
             "series_id": eb_event.series_id,
         }
     )
 ```
+
+**Benefits of using `BaseEventRecord`:**
+- No duplication of core field definitions
+- If `StandardizedEvent` schema changes, update `BaseEventRecord` once
+- Source-specific records automatically inherit the updates
 
 This architecture makes it easy to:
 - Query across all sources using core fields
